@@ -1,0 +1,16 @@
+# Test requests against the built-in echo server.
+# Start the server first:  http-client serve
+# Then run:                http-client run example.http
+
+GET http://127.0.0.1:8080/health HTTP/1.1
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8080/api/cleanupVoices HTTP/1.1
+content-type: application/json
+Authorization: Bearer demo-token
+
+{
+  "limit": 300
+}
