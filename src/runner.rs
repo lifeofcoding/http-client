@@ -1,4 +1,5 @@
 use crate::parser::ParsedRequest;
+use crate::vars::redact;
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
@@ -37,14 +38,14 @@ impl Colors {
     }
 }
 
-pub fn print_request(req: &ParsedRequest) {
-    println!("{} {}", req.method, req.url);
+pub fn print_request(req: &ParsedRequest, masked: &[String]) {
+    println!("{} {}", req.method, redact(&req.url, masked));
     for (name, value) in &req.headers {
-        println!("  {name}: {value}");
+        println!("  {}: {}", redact(name, masked), redact(value, masked));
     }
     if let Some(body) = &req.body {
         println!();
-        for line in body.lines() {
+        for line in redact(body, masked).lines() {
             println!("  {line}");
         }
     }
@@ -56,6 +57,7 @@ pub fn execute(
     verbose: bool,
     pretty: bool,
     colors: &Colors,
+    masked: &[String],
 ) -> Result<(), String> {
     let method = reqwest::Method::from_bytes(req.method.as_bytes())
         .map_err(|e| format!("invalid method `{}`: {e}", req.method))?;
@@ -68,7 +70,12 @@ pub fn execute(
         builder = builder.body(body.clone());
     }
 
-    println!("{} {} {}", colors.dim("→"), req.method, req.url);
+    println!(
+        "{} {} {}",
+        colors.dim("→"),
+        req.method,
+        redact(&req.url, masked)
+    );
 
     let start = Instant::now();
     let response = builder
@@ -99,14 +106,15 @@ pub fn execute(
         for name in names {
             for value in response.headers().get_all(name) {
                 let value = value.to_str().unwrap_or("<binary>");
-                println!("  {}: {}", colors.dim(name), value);
+                println!("  {}: {}", colors.dim(name), redact(value, masked));
             }
         }
     }
 
     let bytes = response.bytes().map_err(|e| format!("reading body: {e}"))?;
     if !bytes.is_empty() {
-        println!("{}", render_body(&bytes, &content_type, pretty));
+        let rendered = render_body(&bytes, &content_type, pretty);
+        println!("{}", redact(&rendered, masked));
     }
 
     Ok(())
@@ -122,11 +130,13 @@ fn status_label(status: reqwest::StatusCode, reason: &str, colors: &Colors) -> S
 }
 
 fn render_body(bytes: &[u8], content_type: &str, pretty: bool) -> String {
-    if pretty && content_type.contains("json")
+    if pretty
+        && content_type.contains("json")
         && let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
-            && let Ok(formatted) = serde_json::to_string_pretty(&value) {
-                return formatted;
-            }
+        && let Ok(formatted) = serde_json::to_string_pretty(&value)
+    {
+        return formatted;
+    }
     String::from_utf8_lossy(bytes).into_owned()
 }
 
