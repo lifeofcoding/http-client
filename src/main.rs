@@ -25,27 +25,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Execute the requests in a .http file
+    #[command(
+        after_help = "Examples:\n  http-client run requests.http\n  http-client run requests.http --env-file .env\n  http-client run requests.http --request 2 --dry-run"
+    )]
     Run {
+        /// .http file to execute
         file: PathBuf,
+        /// Run only this request (1-based)
         #[arg(short, long, value_name = "N")]
         request: Option<usize>,
+        /// Print parsed request(s) without sending
         #[arg(long)]
         dry_run: bool,
+        /// Also print response headers
         #[arg(short, long)]
         verbose: bool,
+        /// Don't pretty-print JSON response bodies
         #[arg(long)]
         no_pretty: bool,
+        /// Load a KEY=value file as a variable source; entries override env vars (repeatable)
         #[arg(long, value_name = "FILE")]
         env_file: Vec<PathBuf>,
+        /// Don't redact substituted secret values in output
         #[arg(long)]
         no_redact: bool,
     },
+    /// Start the built-in echo server
     Serve {
+        /// Port to listen on
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// HTTP status code to respond with
         #[arg(long, default_value_t = 200)]
         status: u16,
     },
+    /// Spawn an ephemeral echo server and fire sample requests at it
     Demo,
 }
 
