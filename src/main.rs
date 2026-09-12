@@ -1,13 +1,16 @@
 mod parser;
 mod runner;
 mod server;
+mod vars;
 
 use clap::{Parser, Subcommand};
 use parser::{ParseError, ParsedRequest, parse};
 use runner::{Colors, execute, print_request};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+use vars::Secrets;
 
 #[derive(Parser)]
 #[command(
@@ -22,23 +25,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Execute the requests in a .http file
+    #[command(
+        after_help = "Examples:\n  http-client run requests.http\n  http-client run requests.http --env-file .env\n  http-client run requests.http --request 2 --dry-run"
+    )]
     Run {
+        /// .http file to execute
         file: PathBuf,
+        /// Run only this request (1-based)
         #[arg(short, long, value_name = "N")]
         request: Option<usize>,
+        /// Print parsed request(s) without sending
         #[arg(long)]
         dry_run: bool,
+        /// Also print response headers
         #[arg(short, long)]
         verbose: bool,
+        /// Don't pretty-print JSON response bodies
         #[arg(long)]
         no_pretty: bool,
+        /// Load a KEY=value file as a variable source; entries override env vars (repeatable)
+        #[arg(long, value_name = "FILE")]
+        env_file: Vec<PathBuf>,
+        /// Don't redact substituted secret values in output
+        #[arg(long)]
+        no_redact: bool,
     },
+    /// Start the built-in echo server
     Serve {
+        /// Port to listen on
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// HTTP status code to respond with
         #[arg(long, default_value_t = 200)]
         status: u16,
     },
+    /// Spawn an ephemeral echo server and fire sample requests at it
     Demo,
 }
 
@@ -51,7 +73,11 @@ fn main() -> ExitCode {
             dry_run,
             verbose,
             no_pretty,
-        } => cmd_run(file, request, dry_run, verbose, no_pretty),
+            env_file,
+            no_redact,
+        } => cmd_run(
+            file, request, dry_run, verbose, no_pretty, env_file, no_redact,
+        ),
         Command::Serve { port, status } => {
             server::run(server::ServeOptions { port, status });
             ExitCode::SUCCESS
@@ -66,6 +92,8 @@ fn cmd_run(
     dry_run: bool,
     verbose: bool,
     no_pretty: bool,
+    env_files: Vec<PathBuf>,
+    no_redact: bool,
 ) -> ExitCode {
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -75,7 +103,7 @@ fn cmd_run(
         }
     };
 
-    let requests = match parse(&content) {
+    let mut requests = match parse(&content) {
         Ok(r) => r,
         Err(ParseError(msg)) => {
             eprintln!("error parsing {}: {msg}", path.display());
@@ -88,8 +116,8 @@ fn cmd_run(
         return ExitCode::FAILURE;
     }
 
-    let selected: Vec<&ParsedRequest> = match index {
-        Some(i) if (1..=requests.len()).contains(&i) => vec![&requests[i - 1]],
+    let selected_idx: Vec<usize> = match index {
+        Some(i) if (1..=requests.len()).contains(&i) => vec![i - 1],
         Some(i) => {
             eprintln!(
                 "error: --request {i} is out of range (file has {} request{})",
@@ -98,7 +126,53 @@ fn cmd_run(
             );
             return ExitCode::FAILURE;
         }
-        None => requests.iter().collect(),
+        None => (0..requests.len()).collect(),
+    };
+
+    let mut secrets = match Secrets::load(&env_files) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut malformed: Vec<usize> = Vec::new();
+    let mut unresolved: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for &i in &selected_idx {
+        let req = &mut requests[i];
+        subst_field(
+            &mut secrets,
+            &mut req.url,
+            i,
+            &mut malformed,
+            &mut unresolved,
+        );
+        for (name, value) in &mut req.headers {
+            subst_field(&mut secrets, name, i, &mut malformed, &mut unresolved);
+            subst_field(&mut secrets, value, i, &mut malformed, &mut unresolved);
+        }
+        if let Some(body) = &mut req.body {
+            subst_field(&mut secrets, body, i, &mut malformed, &mut unresolved);
+        }
+    }
+
+    if !malformed.is_empty() || !unresolved.is_empty() {
+        eprintln!("error: variable substitution failed in {}:", path.display());
+        for (name, reqs) in &unresolved {
+            eprintln!("  {name} ({})", fmt_request_numbers(reqs));
+        }
+        for &i in &malformed {
+            eprintln!("  unterminated {{{{ placeholder (request {})", i + 1);
+        }
+        return ExitCode::FAILURE;
+    }
+
+    let selected: Vec<&ParsedRequest> = selected_idx.iter().map(|&i| &requests[i]).collect();
+    let masked: &[String] = if no_redact {
+        &[]
+    } else {
+        secrets.masked_values()
     };
 
     let colors = Colors::auto();
@@ -108,7 +182,7 @@ fn cmd_run(
             if n > 0 {
                 println!();
             }
-            print_request(req);
+            print_request(req, masked);
         }
         return ExitCode::SUCCESS;
     }
@@ -126,7 +200,7 @@ fn cmd_run(
         if n > 0 {
             println!();
         }
-        if let Err(e) = execute(&client, req, verbose, !no_pretty, &colors) {
+        if let Err(e) = execute(&client, req, verbose, !no_pretty, &colors, masked) {
             eprintln!("error: {e}");
             failed = true;
         }
@@ -144,7 +218,20 @@ fn cmd_demo() -> ExitCode {
     println!("echo server on http://127.0.0.1:{port}\n");
 
     let base = format!("http://127.0.0.1:{port}");
-    let requests = [ParsedRequest {
+    let mut secrets = Secrets::from_maps(
+        HashMap::from([(
+            String::from("DEMO_TOKEN"),
+            std::env::var("DEMO_TOKEN").unwrap_or_else(|_| String::from("demo-token")),
+        )]),
+        HashMap::new(),
+    );
+
+    let token_header = secrets
+        .substitute("Bearer {{DEMO_TOKEN}}")
+        .unwrap_or_else(|_| String::from("Bearer {{DEMO_TOKEN}}"));
+
+    let requests = [
+        ParsedRequest {
             method: "GET".into(),
             url: format!("{base}/hello?name=world"),
             headers: vec![("Accept".into(), "application/json".into())],
@@ -158,7 +245,14 @@ fn cmd_demo() -> ExitCode {
                 ("Authorization".into(), "Bearer demo-token".into()),
             ],
             body: Some("{\n  \"limit\": 300\n}".into()),
-        }];
+        },
+        ParsedRequest {
+            method: "GET".into(),
+            url: format!("{base}/auth"),
+            headers: vec![("Authorization".into(), token_header)],
+            body: None,
+        },
+    ];
 
     let client = match build_client() {
         Ok(c) => c,
@@ -174,7 +268,7 @@ fn cmd_demo() -> ExitCode {
         if n > 0 {
             println!();
         }
-        if let Err(e) = execute(&client, req, false, true, &colors) {
+        if let Err(e) = execute(&client, req, false, true, &colors, secrets.masked_values()) {
             eprintln!("error: {e}");
             failed = true;
         }
@@ -184,6 +278,38 @@ fn cmd_demo() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+fn subst_field(
+    secrets: &mut Secrets,
+    field: &mut String,
+    index: usize,
+    malformed: &mut Vec<usize>,
+    unresolved: &mut BTreeMap<String, Vec<usize>>,
+) {
+    match secrets.substitute(field.as_str()) {
+        Ok(resolved) => *field = resolved,
+        Err(e) => {
+            if e.malformed && malformed.last() != Some(&index) {
+                malformed.push(index);
+            }
+            for name in e.unresolved {
+                let reqs = unresolved.entry(name).or_default();
+                if reqs.last() != Some(&index) {
+                    reqs.push(index);
+                }
+            }
+        }
+    }
+}
+
+fn fmt_request_numbers(reqs: &[usize]) -> String {
+    let nums: Vec<String> = reqs.iter().map(|i| (i + 1).to_string()).collect();
+    if nums.len() == 1 {
+        format!("request {}", nums[0])
+    } else {
+        format!("requests {}", nums.join(", "))
     }
 }
 

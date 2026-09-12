@@ -9,7 +9,7 @@ Accept: application/json
 
 POST http://127.0.0.1:8080/api/cleanupVoices HTTP/1.1
 content-type: application/json
-Authorization: Bearer demo-token
+Authorization: Bearer {{TOKEN}}
 
 {
   "limit": 300
